@@ -135,6 +135,7 @@ module ActiveRecord
         sorted_tables = @connection.tables.sort
 
         not_ignored_tables = sorted_tables.reject { |table_name| ignored?(table_name) }
+        preload_columns(not_ignored_tables)
 
         not_ignored_tables.each_with_index do |table_name, index|
           table(table_name, stream)
@@ -155,8 +156,13 @@ module ActiveRecord
         end
       end
 
+      def preload_columns(tables)
+        @cached_columns ||= @connection.load_columns(tables)
+      end
+
       def table(table, stream)
-        columns = @connection.columns(table)
+        @cached_columns ||= {}
+        columns = @cached_columns[table].present? ? @cached_columns[table] : @connection.columns(table)
         begin
           self.table_name = table
 
