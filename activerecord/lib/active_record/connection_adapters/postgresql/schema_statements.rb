@@ -178,46 +178,91 @@ module ActiveRecord
         # Returns a comment stored in database for given table
         def table_comment(table_name) # :nodoc:
           scope = quoted_scope(table_name, type: "BASE TABLE")
+
           if scope[:name]
-            query_value(<<~SQL, "SCHEMA")
-              SELECT pg_catalog.obj_description(c.oid, 'pg_class')
+            find_in_cache(scope[:name], scope[:types], scope[:schema])
+          end
+        end
+
+        def find_in_cache(name, types, schema)
+          preload_comment
+          return unless types
+
+          types.map do |type|
+            @preloaded_comments[[name, type, schema]]
+          end.compact
+        end
+
+        def preload_comment # :nodoc:
+          return if @preloaded_comments
+          obj_descriptions = query(<<~SQL, "SCHEMA")
+              SELECT c.relname, c.relkind, n.nspname, pg_catalog.obj_description(c.oid, 'pg_class')
               FROM pg_catalog.pg_class c
                 LEFT JOIN pg_namespace n ON n.oid = c.relnamespace
-              WHERE c.relname = #{scope[:name]}
-                AND c.relkind IN (#{scope[:type]})
-                AND n.nspname = #{scope[:schema]}
-            SQL
-          end
+          SQL
+
+          @preloaded_comments = obj_descriptions.map do |row|
+            [[row[0], row[1], row[2]], row[3]]
+          end.to_h
         end
 
         # Returns the partition definition of a given table
         def table_partition_definition(table_name) # :nodoc:
           scope = quoted_scope(table_name, type: "BASE TABLE")
 
-          query_value(<<~SQL, "SCHEMA")
-            SELECT pg_catalog.pg_get_partkeydef(c.oid)
+          if scope
+            find_table_partition_definition(scope[:name], scope[:type], scope[:schema])
+          end
+        end
+
+        def find_table_partition_definition(relname, relkind, nspname)
+          preload_table_partition_definition
+
+          @preloaded_table_partition_definition[[relname, relkind, nspname]]
+        end
+
+        def preload_table_partition_definition
+          return if @preloaded_table_partition_definition
+
+          obj_descriptions = query(<<~SQL, "SCHEMA")
+            SELECT c.relname, c.relkind, n.nspname, pg_catalog.pg_get_partkeydef(c.oid)
             FROM pg_catalog.pg_class c
               LEFT JOIN pg_namespace n ON n.oid = c.relnamespace
-            WHERE c.relname = #{scope[:name]}
-              AND c.relkind IN (#{scope[:type]})
-              AND n.nspname = #{scope[:schema]}
           SQL
+
+          @preloaded_table_partition_definition = obj_descriptions.map do |row|
+            [[row[0], row[1], row[2]], row[3]]
+          end.to_h
         end
 
         # Returns the inherited table name of a given table
         def inherited_table_names(table_name) # :nodoc:
           scope = quoted_scope(table_name, type: "BASE TABLE")
 
-          query_values(<<~SQL, "SCHEMA")
-            SELECT parent.relname
+          if scope
+            find_inherited_table_names(scope[:name], scope[:type], scope[:schema])
+          end
+        end
+
+        def find_inherited_table_names(relname, relkind, nspname)
+          preload_inherited_table_names
+
+          @preloaded_inherited_table_names[[relname, relkind, nspname]]
+        end
+
+        def preload_inherited_table_names # :nodoc:
+          return if @preloaded_inherited_table_names
+          obj_descriptions = query(<<~SQL, "SCHEMA")
+            SELECT child.relname, child.relkind, n.nspname, parent.relname
             FROM pg_catalog.pg_inherits i
               JOIN pg_catalog.pg_class child ON i.inhrelid = child.oid
               JOIN pg_catalog.pg_class parent ON i.inhparent = parent.oid
               LEFT JOIN pg_namespace n ON n.oid = child.relnamespace
-            WHERE child.relname = #{scope[:name]}
-              AND child.relkind IN (#{scope[:type]})
-              AND n.nspname = #{scope[:schema]}
           SQL
+
+          @preloaded_inherited_table_names = obj_descriptions.map do |row|
+            [[row[0], row[1], row[2]], row[3]]
+          end.to_h
         end
 
         # Returns the current database name.
@@ -415,19 +460,32 @@ module ActiveRecord
         end
 
         def primary_keys(table_name) # :nodoc:
-          query_values(<<~SQL, "SCHEMA")
-            SELECT a.attname
+          find_primary_keys(table_name)
+        end
+
+        def find_primary_keys(table_name)
+          preload_primary_keys
+
+          @preloaded_primary_keys[table_name]
+        end
+
+        def preload_primary_keys
+          return if @preloaded_primary_keys
+
+          rows = query(<<~SQL, "SCHEMA")
+            SELECT (indrelid::regclass)::text, i.idx, a.attname
               FROM (
                      SELECT indrelid, indkey, generate_subscripts(indkey, 1) idx
                        FROM pg_index
-                      WHERE indrelid = #{quote(quote_table_name(table_name))}::regclass
-                        AND indisprimary
+                      WHERE indisprimary
                    ) i
               JOIN pg_attribute a
                 ON a.attrelid = i.indrelid
                AND a.attnum = i.indkey[i.idx]
              ORDER BY i.idx
           SQL
+
+          @preloaded_primary_keys = rows.group_by(&:first).transform_values { |rows| rows.sort { |row| row[1] }.map { |row| row[2] }}
         end
 
         # Renames a table.

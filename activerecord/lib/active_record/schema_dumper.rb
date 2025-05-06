@@ -135,7 +135,6 @@ module ActiveRecord
         sorted_tables = @connection.tables.sort
 
         not_ignored_tables = sorted_tables.reject { |table_name| ignored?(table_name) }
-        puts("OK. Preloaddedt")
         preload_columns(not_ignored_tables)
 
         not_ignored_tables.each_with_index do |table_name, index|
@@ -159,13 +158,10 @@ module ActiveRecord
 
       def preload_columns(tables)
         @cached_columns ||= @connection.load_columns(tables)
-        puts("preloaded_columns: #{@cached_columns.size}")
-        puts("preloaded: #{@cached_columns}")
       end
 
       def table(table, stream)
         @cached_columns ||= {}
-        puts("cache hit?: #{@cached_columns[table].present?}")
         columns = @cached_columns[table].present? ? @cached_columns[table] : @connection.columns(table)
         begin
           self.table_name = table
