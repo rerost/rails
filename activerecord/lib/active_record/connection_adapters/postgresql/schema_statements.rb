@@ -85,34 +85,49 @@ module ActiveRecord
         # Returns an array of indexes for the given table.
         def indexes(table_name) # :nodoc:
           scope = quoted_scope(table_name)
+          if scope
+            find_indexes(table_name, scope[:name], scope[:schema]) || []
+          else
+            []
+          end
+        end
 
+        def find_indexes(table_name, name, schema)
+          preload_indexes
+
+          @preloaded_indexes[[table_name, name, schema]]
+        end
+
+        def preload_indexes
+          return if @preloaded_indexes
           result = query(<<~SQL, "SCHEMA")
-            SELECT distinct i.relname, d.indisunique, d.indkey, pg_get_indexdef(d.indexrelid),
+            SELECT distinct (t.relname::regclass)::text AS table_name, i.relname, d.indisunique, d.indkey, pg_get_indexdef(d.indexrelid), 
                             pg_catalog.obj_description(i.oid, 'pg_class') AS comment, d.indisvalid,
                             ARRAY(
                               SELECT pg_get_indexdef(d.indexrelid, k + 1, true)
                               FROM generate_subscripts(d.indkey, 1) AS k
                               ORDER BY k
-                            ) AS columns
+                            ) AS columns,
+                            n.nspname
             FROM pg_class t
             INNER JOIN pg_index d ON t.oid = d.indrelid
             INNER JOIN pg_class i ON d.indexrelid = i.oid
             LEFT JOIN pg_namespace n ON n.oid = t.relnamespace
             WHERE i.relkind IN ('i', 'I')
               AND d.indisprimary = 'f'
-              AND t.relname = #{scope[:name]}
-              AND n.nspname = #{scope[:schema]}
             ORDER BY i.relname
           SQL
 
-          result.map do |row|
-            index_name = row[0]
-            unique = row[1]
-            indkey = row[2].split(" ").map(&:to_i)
-            inddef = row[3]
-            comment = row[4]
-            valid = row[5]
-            columns = decode_string_array(row[6]).map { |c| Utils.unquote_identifier(c.strip.gsub('""', '"')) }
+          @preloaded_indexes = result.map do |row|
+            table_name = row[0]
+            index_name = row[1]
+            unique = row[2]
+            indkey = row[3].split(" ").map(&:to_i)
+            inddef = row[4]
+            comment = row[5]
+            valid = row[6]
+            columns = decode_string_array(row[7]).map { |c| Utils.unquote_identifier(c.strip.gsub('""', '"')) }
+            schema = row[8]
 
             using, expressions, include, nulls_not_distinct, where = inddef.scan(/ USING (\w+?) \((.+?)\)(?: INCLUDE \((.+?)\))?( NULLS NOT DISTINCT)?(?: WHERE (.+))?\z/m).flatten
 
@@ -138,7 +153,9 @@ module ActiveRecord
               end
             end
 
-            IndexDefinition.new(
+            [
+              [table_name, index_name, schema],
+              IndexDefinition.new(
               table_name,
               index_name,
               unique,
@@ -151,8 +168,8 @@ module ActiveRecord
               nulls_not_distinct: nulls_not_distinct.present?,
               comment: comment.presence,
               valid: valid
-            )
-          end
+            )]
+          end.to_h
         end
 
         def table_options(table_name) # :nodoc:
@@ -735,17 +752,30 @@ module ActiveRecord
         def exclusion_constraints(table_name)
           scope = quoted_scope(table_name)
 
+          if scope
+            find_exclusion_constraints(scope[:name], scope[:schema])
+          else
+            []
+          end
+        end
+
+        def find_exclusion_constraints(name, schema)
+          preload_exclusion_constraints
+
+          return @preloaded_exclusion_constraints[[name, schema]] || []
+        end
+
+        def preload_exclusion_constraints
+          return if @preloaded_exclusion_constraints
           exclusion_info = internal_exec_query(<<-SQL, "SCHEMA")
-            SELECT conname, pg_get_constraintdef(c.oid) AS constraintdef, c.condeferrable, c.condeferred
+            SELECT t.relname, n.nspname, conname, pg_get_constraintdef(c.oid) AS constraintdef, c.condeferrable, c.condeferred
             FROM pg_constraint c
             JOIN pg_class t ON c.conrelid = t.oid
             JOIN pg_namespace n ON n.oid = c.connamespace
             WHERE c.contype = 'x'
-              AND t.relname = #{scope[:name]}
-              AND n.nspname = #{scope[:schema]}
           SQL
 
-          exclusion_info.map do |row|
+          @preloaded_exclusion_constraints = exclusion_info.map do |row|
             method_and_elements, predicate = row["constraintdef"].split(" WHERE ")
             method_and_elements_parts = method_and_elements.match(/EXCLUDE(?: USING (?<using>\S+))? \((?<expression>.+)\)/)
             predicate.remove!(/ DEFERRABLE(?: INITIALLY (?:IMMEDIATE|DEFERRED))?/) if predicate
@@ -760,8 +790,8 @@ module ActiveRecord
               deferrable: deferrable
             }
 
-            ExclusionConstraintDefinition.new(table_name, method_and_elements_parts["expression"], options)
-          end
+            [[row["relname"], row["nspname"]], ExclusionConstraintDefinition.new(table_name, method_and_elements_parts["expression"], options)]
+          end.to_h
         end
 
         # Returns an array of unique constraints for the given table.
@@ -769,8 +799,25 @@ module ActiveRecord
         def unique_constraints(table_name)
           scope = quoted_scope(table_name)
 
+          if scope
+            find_unique_constraints(scope[:name], scope[:schema]) || []
+          else
+            []
+          end
+        end
+
+        def find_unique_constraints(name, schema)
+          preload_unique_constraints
+
+          @preloaded_unique_constraints[[name, schema]]
+        end
+
+        def preload_unique_constraints
+          return if @preloaded_unique_constraints
+
+          # conkey_names のあたり、正しくPreloadできているか不安（絞り込み前提になっていないか？）
           unique_info = internal_exec_query(<<~SQL, "SCHEMA", allow_retry: true, materialize_transactions: false)
-            SELECT c.conname, c.conrelid, c.condeferrable, c.condeferred, pg_get_constraintdef(c.oid) AS constraintdef,
+            SELECT (c.conrelid::regclass)::text AS table_name, t.relname, n.nspname, c.conname, c.conrelid, c.condeferrable, c.condeferred, pg_get_constraintdef(c.oid) AS constraintdef,
             (
               SELECT array_agg(a.attname ORDER BY idx)
               FROM (
@@ -784,11 +831,9 @@ module ActiveRecord
             JOIN pg_class t ON c.conrelid = t.oid
             JOIN pg_namespace n ON n.oid = c.connamespace
             WHERE c.contype = 'u'
-              AND t.relname = #{scope[:name]}
-              AND n.nspname = #{scope[:schema]}
           SQL
 
-          unique_info.map do |row|
+          @preloaded_unique_constraints = unique_info.map do |row|
             columns = decode_string_array(row["conkey_names"])
 
             nulls_not_distinct = row["constraintdef"].start_with?("UNIQUE NULLS NOT DISTINCT")
@@ -800,8 +845,8 @@ module ActiveRecord
               deferrable: deferrable
             }
 
-            UniqueConstraintDefinition.new(table_name, columns, options)
-          end
+            [[row["relname"], row["nspname"]], UniqueConstraintDefinition.new(row["table_name"], columns, options)]
+          end.to_h
         end
 
         # Adds a new exclusion constraint to the table. +expression+ is a String
