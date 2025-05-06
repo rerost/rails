@@ -1050,6 +1050,7 @@ module ActiveRecord
         # column_definitions:      String   -> Array
         # load_column_definitions: String[] -> Hash<String, Array>
         def load_column_definitions(table_names)
+          return {} if table_names.size == 0
           escaped_table_names = table_names
                                   .map { |table_name| "#{quote(quote_table_name(table_name))}::regclass"}
                                   .join(",")
