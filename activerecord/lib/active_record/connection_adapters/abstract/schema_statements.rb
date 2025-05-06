@@ -112,6 +112,22 @@ module ActiveRecord
         end
       end
 
+      # Returns an hash of +table_name+ and +Column+ objects
+      def load_columns(table_names)
+        table_names = table_names.map(&:to_s)
+
+        column_definitions_map = load_column_definitions(table_names)
+        table_names.map do |table_name|
+          definitions = column_definitions_map[table_name] || []
+          [
+            table_name,
+            definitions.map do |field|
+              new_column_from_field(table_name, field, definitions)
+            end
+          ]
+        end.to_h
+      end
+
       # Checks to see if a column exists in a given table.
       #
       #   # Check a column exists

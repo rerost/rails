@@ -1044,6 +1044,40 @@ module ActiveRecord
           SQL
         end
 
+        # Returns the Hash of a table's column names, data types, and default values.
+        #
+        # Batch load version of `column_definitions`
+        # column_definitions:      String   -> Array
+        # load_column_definitions: String[] -> Hash<String, Array>
+        def load_column_definitions(table_names)
+          return {} if table_names.size == 0
+          escaped_table_names = table_names
+                                  .map { |table_name| "#{quote(quote_table_name(table_name))}::regclass"}
+                                  .join(",")
+
+          tables_and_columns = query(<<~SQL, "SCHEMA")
+            SELECT (a.attrelid::regclass)::text, a.attnum, a.attname, format_type(a.atttypid, a.atttypmod),
+                   pg_get_expr(d.adbin, d.adrelid), a.attnotnull, a.atttypid, a.atttypmod,
+                   c.collname, col_description(a.attrelid, a.attnum) AS comment,
+                   #{supports_identity_columns? ? 'attidentity' : quote('')} AS identity,
+                   #{supports_virtual_columns? ? 'attgenerated' : quote('')} as attgenerated
+              FROM pg_attribute a
+              LEFT JOIN pg_attrdef d ON a.attrelid = d.adrelid AND a.attnum = d.adnum
+              LEFT JOIN pg_type t ON a.atttypid = t.oid
+              LEFT JOIN pg_collation c ON a.attcollation = c.oid AND a.attcollation <> t.typcollation
+             WHERE a.attrelid IN (#{escaped_table_names})
+               AND a.attnum > 0 AND NOT a.attisdropped
+          SQL
+
+          tables_and_columns
+            .group_by(&:first)
+            .transform_values do |rows|
+              rows
+                .sort_by { |r| r[1] } # ORDER BY a.attnum
+               .map{ |columns| columns[2..] } # Ignore `(a.attrelid::regclass)::text`, `a.attnum`
+            end
+        end
+
         def arel_visitor
           Arel::Visitors::PostgreSQL.new(self)
         end
