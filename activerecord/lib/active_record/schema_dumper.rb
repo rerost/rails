@@ -135,6 +135,7 @@ module ActiveRecord
         sorted_tables = @connection.tables.sort
 
         not_ignored_tables = sorted_tables.reject { |table_name| ignored?(table_name) }
+        puts("OK. Preloaddedt")
         preload_columns(not_ignored_tables)
 
         not_ignored_tables.each_with_index do |table_name, index|
