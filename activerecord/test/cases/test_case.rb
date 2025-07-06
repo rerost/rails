@@ -302,7 +302,7 @@ module ActiveRecord
 
   class PostgreSQLTestCase < TestCase
     def self.run(*args)
-      super if current_adapter?(:PostgreSQLAdapter)
+      super if current_adapter?(:PostgreSQLAdapter, :PreloadablePostgreSQLAdapter)
     end
   end
 

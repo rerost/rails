@@ -14,6 +14,9 @@ require "active_support/core_ext/kernel/singleton_class"
 if defined?(ActiveRecord::ConnectionAdapters::PostgreSQLAdapter)
   ActiveRecord::ConnectionAdapters::PostgreSQLAdapter.create_unlogged_tables = true
 end
+if defined?(ActiveRecord::ConnectionAdapters::PreloadablePostgreSQLAdapter)
+  ActiveRecord::ConnectionAdapters::PreloadablePostgreSQLAdapter.create_unlogged_tables = true
+end
 
 # TODO: Move all these random hacks into the ARTest namespace and into the support/ dir
 
