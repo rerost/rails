@@ -1,5 +1,7 @@
 # frozen_string_literal: true
 require "active_record/connection_adapters/postgresql_adapter"
+require "active_record/connection_adapters/postgresql/schema_definitions"
+require "active_support/core_ext/string"
 
 module ActiveRecord::ConnectionAdapters
   class PreloadablePostgreSQLAdapter < ActiveRecord::ConnectionAdapters::PostgreSQLAdapter
@@ -16,6 +18,10 @@ module ActiveRecord::ConnectionAdapters
       :primary_keys,
       :table_options,
       :indexes,
+      :foreign_keys,
+      :check_constraints,
+      :exclusion_constraints,
+      :unique_constraints,
     ].freeze
 
     def preload(table_names)
@@ -26,7 +32,7 @@ module ActiveRecord::ConnectionAdapters
       end
     end
 
-    CACHEABLE_METHODS.each do |method_name |
+    CACHEABLE_METHODS.each do |method_name|
       define_method(method_name) do |table_name|
         get_cached_or_compute(method_name, table_name) { super(table_name) }
       end
@@ -103,42 +109,42 @@ module ActiveRecord::ConnectionAdapters
     end
 
     def preload_indexes(table_names)
-      @__preload[:table_options] ||= table_names.map do |table_name|
+      @__preload[:indexes] ||= table_names.map do |table_name|
         scope = quoted_scope(table_name)
 
         result = query(<<~SQL, "SCHEMA")
-              SELECT distinct i.relname, d.indisunique, d.indkey, pg_get_indexdef(d.indexrelid),
-                              pg_catalog.obj_description(i.oid, 'pg_class') AS comment, d.indisvalid,
-                              ARRAY(
-                                SELECT pg_get_indexdef(d.indexrelid, k + 1, true)
-                                FROM generate_subscripts(d.indkey, 1) AS k
-                                ORDER BY k
-                              ) AS columns
-              FROM pg_class t
-              INNER JOIN pg_index d ON t.oid = d.indrelid
-              INNER JOIN pg_class i ON d.indexrelid = i.oid
-              LEFT JOIN pg_namespace n ON n.oid = t.relnamespace
-              WHERE i.relkind IN ('i', 'I')
-                AND d.indisprimary = 'f'
-                AND t.relname = #{scope[:name]}
-                AND n.nspname = #{scope[:schema]}
-              ORDER BY i.relname
-            SQL
+          SELECT distinct i.relname, d.indisunique, d.indkey, pg_get_indexdef(d.indexrelid),
+                          pg_catalog.obj_description(i.oid, 'pg_class') AS comment, d.indisvalid,
+                          ARRAY(
+                            SELECT pg_get_indexdef(d.indexrelid, k + 1, true)
+                            FROM generate_subscripts(d.indkey, 1) AS k
+                            ORDER BY k
+                          ) AS columns
+          FROM pg_class t
+          INNER JOIN pg_index d ON t.oid = d.indrelid
+          INNER JOIN pg_class i ON d.indexrelid = i.oid
+          LEFT JOIN pg_namespace n ON n.oid = t.relnamespace
+          WHERE i.relkind IN ('i', 'I')
+            AND d.indisprimary = 'f'
+            AND t.relname = #{scope[:name]}
+            AND n.nspname = #{scope[:schema]}
+          ORDER BY i.relname
+        SQL
 
-        result.map do |row|
+        indexes = result.map do |row|
           index_name = row[0]
           unique = row[1]
           indkey = row[2].split(" ").map(&:to_i)
           inddef = row[3]
           comment = row[4]
           valid = row[5]
-          columns = decode_string_array(row[6]).map { |c| Utils.unquote_identifier(c.strip.gsub('""', '"')) }
+          columns = decode_string_array(row[6]).map { |c| PostgreSQL::Utils.unquote_identifier(c.strip.gsub('""', '"')) }
 
           using, expressions, include, nulls_not_distinct, where = inddef.scan(/ USING (\w+?) \((.+?)\)(?: INCLUDE \((.+?)\))?( NULLS NOT DISTINCT)?(?: WHERE (.+))?\z/m).flatten
 
           orders = {}
           opclasses = {}
-          include_columns = include ? include.split(",").map { |c| Utils.unquote_identifier(c.strip.gsub('""', '"')) } : []
+          include_columns = include ? include.split(",").map { |c| PostgreSQL::Utils.unquote_identifier(c.strip.gsub('""', '"')) } : []
 
           if indkey.include?(0)
             columns = expressions
@@ -158,25 +164,193 @@ module ActiveRecord::ConnectionAdapters
             end
           end
 
-          [
+          IndexDefinition.new(
             table_name,
-            IndexDefinition.new(
-              table_name,
-              index_name,
-              unique,
-              columns,
-              orders: orders,
-              opclasses: opclasses,
-              where: where,
-              using: using.to_sym,
-              include: include_columns.presence,
-              nulls_not_distinct: nulls_not_distinct.present?,
-              comment: comment.presence,
-              valid: valid
-            )
-          ]
+            index_name,
+            unique,
+            columns,
+            orders: orders,
+            opclasses: opclasses,
+            where: where,
+            using: using.to_sym,
+            include: include_columns.presence,
+            nulls_not_distinct: nulls_not_distinct.present?,
+            comment: comment.presence,
+            valid: valid
+          )
         end
+
+        [table_name, indexes]
       end.to_h
+    end
+
+    def preload_foreign_keys(table_names)
+      @__preload[:foreign_keys] ||= table_names.map do |table_name|
+        scope = quoted_scope(table_name)
+        fk_info = internal_exec_query(<<~SQL, "SCHEMA", allow_retry: true, materialize_transactions: false)
+          SELECT t2.oid::regclass::text AS to_table, c.conname AS name, c.confupdtype AS on_update, c.confdeltype AS on_delete, c.convalidated AS valid, c.condeferrable AS deferrable, c.condeferred AS deferred, c.conrelid, c.confrelid,
+            (
+              SELECT array_agg(a.attname ORDER BY idx)
+              FROM (
+                SELECT idx, c.conkey[idx] AS conkey_elem
+                FROM generate_subscripts(c.conkey, 1) AS idx
+              ) indexed_conkeys
+              JOIN pg_attribute a ON a.attrelid = t1.oid
+              AND a.attnum = indexed_conkeys.conkey_elem
+            ) AS conkey_names,
+            (
+              SELECT array_agg(a.attname ORDER BY idx)
+              FROM (
+                SELECT idx, c.confkey[idx] AS confkey_elem
+                FROM generate_subscripts(c.confkey, 1) AS idx
+              ) indexed_confkeys
+              JOIN pg_attribute a ON a.attrelid = t2.oid
+              AND a.attnum = indexed_confkeys.confkey_elem
+            ) AS confkey_names
+          FROM pg_constraint c
+          JOIN pg_class t1 ON c.conrelid = t1.oid
+          JOIN pg_class t2 ON c.confrelid = t2.oid
+          JOIN pg_namespace n ON c.connamespace = n.oid
+          WHERE c.contype = 'f'
+            AND t1.relname = #{scope[:name]}
+            AND n.nspname = #{scope[:schema]}
+          ORDER BY c.conname
+        SQL
+
+        [
+          table_name,
+
+          fk_info.map do |row|
+            to_table = PostgreSQL::Utils.unquote_identifier(row["to_table"])
+
+            column = decode_string_array(row["conkey_names"])
+            primary_key = decode_string_array(row["confkey_names"])
+
+            options = {
+              column: column.size == 1 ? column.first : column,
+              name: row["name"],
+              primary_key: primary_key.size == 1 ? primary_key.first : primary_key
+            }
+
+            options[:on_delete] = extract_foreign_key_action(row["on_delete"])
+            options[:on_update] = extract_foreign_key_action(row["on_update"])
+            options[:deferrable] = extract_constraint_deferrable(row["deferrable"], row["deferred"])
+
+            options[:validate] = row["valid"]
+
+            ForeignKeyDefinition.new(table_name, to_table, options)
+          end
+        ]
+      end.to_h
+    end
+
+    def preload_check_constraints(table_names)
+      @__preload[:foreign_keys] ||= table_names.map do |table_name|
+        scope = quoted_scope(table_name)
+
+        check_info = internal_exec_query(<<-SQL, "SCHEMA", allow_retry: true, materialize_transactions: false)
+            SELECT conname, pg_get_constraintdef(c.oid, true) AS constraintdef, c.convalidated AS valid
+            FROM pg_constraint c
+            JOIN pg_class t ON c.conrelid = t.oid
+            JOIN pg_namespace n ON n.oid = c.connamespace
+            WHERE c.contype = 'c'
+              AND t.relname = #{scope[:name]}
+              AND n.nspname = #{scope[:schema]}
+        SQL
+
+        [
+          table_name,
+          check_info.map do |row|
+            options = {
+              name: row["conname"],
+              validate: row["valid"]
+            }
+            expression = row["constraintdef"][/CHECK \((.+)\)/m, 1]
+
+            CheckConstraintDefinition.new(table_name, expression, options)
+          end
+        ]
+      end.to_h
+    end
+
+    def preload_exclusion_constraints(table_names)
+      @__preload[:foreign_keys] ||= table_names.map do |table_name|
+        scope = quoted_scope(table_name)
+
+        exclusion_info = internal_exec_query(<<-SQL, "SCHEMA")
+            SELECT conname, pg_get_constraintdef(c.oid) AS constraintdef, c.condeferrable, c.condeferred
+            FROM pg_constraint c
+            JOIN pg_class t ON c.conrelid = t.oid
+            JOIN pg_namespace n ON n.oid = c.connamespace
+            WHERE c.contype = 'x'
+              AND t.relname = #{scope[:name]}
+              AND n.nspname = #{scope[:schema]}
+        SQL
+
+        [
+          table_name,
+          exclusion_info.map do |row|
+            method_and_elements, predicate = row["constraintdef"].split(" WHERE ")
+            method_and_elements_parts = method_and_elements.match(/EXCLUDE(?: USING (?<using>\S+))? \((?<expression>.+)\)/)
+            predicate.remove!(/ DEFERRABLE(?: INITIALLY (?:IMMEDIATE|DEFERRED))?/) if predicate
+            predicate = predicate.from(2).to(-3) if predicate # strip 2 opening and closing parentheses
+
+            deferrable = extract_constraint_deferrable(row["condeferrable"], row["condeferred"])
+
+            options = {
+              name: row["conname"],
+              using: method_and_elements_parts["using"].to_sym,
+              where: predicate,
+              deferrable: deferrable
+            }
+
+            ExclusionConstraintDefinition.new(table_name, method_and_elements_parts["expression"], options)
+          end
+        ]
+      end.to_h
+    end
+
+    def preload_unique_constraints(table_names)
+      @__preload[:foreign_keys] ||= table_names.map do |table_name|
+        scope = quoted_scope(table_name)
+
+        unique_info = internal_exec_query(<<~SQL, "SCHEMA", allow_retry: true, materialize_transactions: false)
+          SELECT c.conname, c.conrelid, c.condeferrable, c.condeferred, pg_get_constraintdef(c.oid) AS constraintdef,
+          (
+            SELECT array_agg(a.attname ORDER BY idx)
+            FROM (
+              SELECT idx, c.conkey[idx] AS conkey_elem
+              FROM generate_subscripts(c.conkey, 1) AS idx
+            ) indexed_conkeys
+            JOIN pg_attribute a ON a.attrelid = t.oid
+            AND a.attnum = indexed_conkeys.conkey_elem
+          ) AS conkey_names
+          FROM pg_constraint c
+          JOIN pg_class t ON c.conrelid = t.oid
+          JOIN pg_namespace n ON n.oid = c.connamespace
+          WHERE c.contype = 'u'
+            AND t.relname = #{scope[:name]}
+            AND n.nspname = #{scope[:schema]}
+        SQL
+
+        [
+          table_name,
+          unique_info.map do |row|
+            columns = decode_string_array(row["conkey_names"])
+
+            nulls_not_distinct = row["constraintdef"].start_with?("UNIQUE NULLS NOT DISTINCT")
+            deferrable = extract_constraint_deferrable(row["condeferrable"], row["condeferred"])
+
+            options = {
+              name: row["conname"],
+              nulls_not_distinct: nulls_not_distinct,
+              deferrable: deferrable
+            }
+
+            UniqueConstraintDefinition.new(table_name, columns, options)
+          end
+        ]
+      end
     end
 
     def get_cached_or_compute(cache_key, table_name)
