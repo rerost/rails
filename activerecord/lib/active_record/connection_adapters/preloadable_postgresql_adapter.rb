@@ -220,41 +220,50 @@ module ActiveRecord::ConnectionAdapters
     end
 
     def preload_foreign_keys(table_names)
+      scope_map = (internal_exec_query(<<~SQL, "SCHEMA", allow_retry: true, materialize_transactions: false)
+        SELECT t1.relname AS relname, n.nspname AS nspname, c.conname AS conname, t2.oid::regclass::text AS to_table, c.conname AS name, c.confupdtype AS on_update, c.confdeltype AS on_delete, c.convalidated AS valid, c.condeferrable AS deferrable, c.condeferred AS deferred, c.conrelid, c.confrelid,
+          (
+            SELECT array_agg(a.attname ORDER BY idx)
+            FROM (
+              SELECT idx, c.conkey[idx] AS conkey_elem
+              FROM generate_subscripts(c.conkey, 1) AS idx
+            ) indexed_conkeys
+            JOIN pg_attribute a ON a.attrelid = t1.oid
+            AND a.attnum = indexed_conkeys.conkey_elem
+          ) AS conkey_names,
+          (
+            SELECT array_agg(a.attname ORDER BY idx)
+            FROM (
+              SELECT idx, c.confkey[idx] AS confkey_elem
+              FROM generate_subscripts(c.confkey, 1) AS idx
+            ) indexed_confkeys
+            JOIN pg_attribute a ON a.attrelid = t2.oid
+            AND a.attnum = indexed_confkeys.confkey_elem
+          ) AS confkey_names
+        FROM pg_constraint c
+        JOIN pg_class t1 ON c.conrelid = t1.oid
+        JOIN pg_class t2 ON c.confrelid = t2.oid
+        JOIN pg_namespace n ON c.connamespace = n.oid
+        WHERE c.contype = 'f'
+          AND n.nspname = ANY (current_schemas(false))
+
+        ORDER BY c.conname
+      SQL
+      ).group_by { |row| quote(row["relname"]) }
+       .transform_values do |rows|
+        rows
+          .group_by { |row| row["nspname"] }
+          .transform_values do |rows|
+          rows.sort_by { |r| r["conname"] }
+        end
+      end
+
       @__preload[:foreign_keys] ||= table_names.map do |table_name|
         scope = quoted_scope(table_name)
-        fk_info = internal_exec_query(<<~SQL, "SCHEMA", allow_retry: true, materialize_transactions: false)
-          SELECT t2.oid::regclass::text AS to_table, c.conname AS name, c.confupdtype AS on_update, c.confdeltype AS on_delete, c.convalidated AS valid, c.condeferrable AS deferrable, c.condeferred AS deferred, c.conrelid, c.confrelid,
-            (
-              SELECT array_agg(a.attname ORDER BY idx)
-              FROM (
-                SELECT idx, c.conkey[idx] AS conkey_elem
-                FROM generate_subscripts(c.conkey, 1) AS idx
-              ) indexed_conkeys
-              JOIN pg_attribute a ON a.attrelid = t1.oid
-              AND a.attnum = indexed_conkeys.conkey_elem
-            ) AS conkey_names,
-            (
-              SELECT array_agg(a.attname ORDER BY idx)
-              FROM (
-                SELECT idx, c.confkey[idx] AS confkey_elem
-                FROM generate_subscripts(c.confkey, 1) AS idx
-              ) indexed_confkeys
-              JOIN pg_attribute a ON a.attrelid = t2.oid
-              AND a.attnum = indexed_confkeys.confkey_elem
-            ) AS confkey_names
-          FROM pg_constraint c
-          JOIN pg_class t1 ON c.conrelid = t1.oid
-          JOIN pg_class t2 ON c.confrelid = t2.oid
-          JOIN pg_namespace n ON c.connamespace = n.oid
-          WHERE c.contype = 'f'
-            AND t1.relname = #{scope[:name]}
-            AND n.nspname = #{scope[:schema]}
-          ORDER BY c.conname
-        SQL
+        fk_info = find_by_scope(scope_map, scope)
 
         [
           table_name,
-
           fk_info.map do |row|
             to_table = PostgreSQL::Utils.unquote_identifier(row["to_table"])
 
