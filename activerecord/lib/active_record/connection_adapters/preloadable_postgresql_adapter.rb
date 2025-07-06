@@ -30,6 +30,14 @@ module ActiveRecord::ConnectionAdapters
       table_partition_definition: []
     }.freeze
 
+    CACHEABLE_METHODS.each do |method_name, _|
+      define_method(method_name) do |table_name|
+        get_cached_or_compute(method_name, table_name) { super(table_name) }
+      end
+    end
+
+    private
+
     def preload(table_names)
       @__preload = {}
       CACHEABLE_METHODS.each do |method_name, children|
@@ -39,14 +47,6 @@ module ActiveRecord::ConnectionAdapters
         send("preload_#{method_name}", table_names)
       end
     end
-
-    CACHEABLE_METHODS.each do |method_name, _|
-      define_method(method_name) do |table_name|
-        get_cached_or_compute(method_name, table_name) { super(table_name) }
-      end
-    end
-
-    private
 
     def preload_column_definitions(table_names)
       table_name_map = (
