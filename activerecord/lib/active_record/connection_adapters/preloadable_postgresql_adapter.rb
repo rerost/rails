@@ -369,27 +369,36 @@ module ActiveRecord::ConnectionAdapters
     end
 
     def preload_unique_constraints(table_names)
+      scope_map = (internal_exec_query(<<~SQL, "SCHEMA", allow_retry: true, materialize_transactions: false)
+        SELECT t.relname AS relname, n.nspname AS nspname, c.conname, c.conrelid, c.condeferrable, c.condeferred, pg_get_constraintdef(c.oid) AS constraintdef,
+        (
+          SELECT array_agg(a.attname ORDER BY idx)
+          FROM (
+            SELECT idx, c.conkey[idx] AS conkey_elem
+            FROM generate_subscripts(c.conkey, 1) AS idx
+          ) indexed_conkeys
+          JOIN pg_attribute a ON a.attrelid = t.oid
+          AND a.attnum = indexed_conkeys.conkey_elem
+        ) AS conkey_names
+        FROM pg_constraint c
+        JOIN pg_class t ON c.conrelid = t.oid
+        JOIN pg_namespace n ON n.oid = c.connamespace
+        WHERE c.contype = 'u'
+          AND n.nspname = ANY (current_schemas(false))
+      SQL
+      ).group_by { |row| quote(row["relname"]) }
+       .transform_values do |rows|
+        rows
+          .group_by { |row| row["nspname"] }
+          .transform_values do |rows|
+          rows.sort_by { |r| r["conname"] }
+        end
+      end
+
       @__preload[:unique_constraints] ||= table_names.map do |table_name|
         scope = quoted_scope(table_name)
 
-        unique_info = internal_exec_query(<<~SQL, "SCHEMA", allow_retry: true, materialize_transactions: false)
-          SELECT c.conname, c.conrelid, c.condeferrable, c.condeferred, pg_get_constraintdef(c.oid) AS constraintdef,
-          (
-            SELECT array_agg(a.attname ORDER BY idx)
-            FROM (
-              SELECT idx, c.conkey[idx] AS conkey_elem
-              FROM generate_subscripts(c.conkey, 1) AS idx
-            ) indexed_conkeys
-            JOIN pg_attribute a ON a.attrelid = t.oid
-            AND a.attnum = indexed_conkeys.conkey_elem
-          ) AS conkey_names
-          FROM pg_constraint c
-          JOIN pg_class t ON c.conrelid = t.oid
-          JOIN pg_namespace n ON n.oid = c.connamespace
-          WHERE c.contype = 'u'
-            AND t.relname = #{scope[:name]}
-            AND n.nspname = #{scope[:schema]}
-        SQL
+        unique_info = find_by_scope(scope_map, scope)
 
         [
           table_name,
@@ -412,58 +421,85 @@ module ActiveRecord::ConnectionAdapters
     end
 
     def preload_table_comment(table_names)
+      scope_map = (query(<<~SQL, "SCHEMA")
+        SELECT c.relname AS relname, n.nspname AS nspname, pg_catalog.obj_description(c.oid, 'pg_class') AS comment
+        FROM pg_catalog.pg_class c
+          LEFT JOIN pg_namespace n ON n.oid = c.relnamespace
+        WHERE c.relkind IN ('r', 'p')
+          AND n.nspname = ANY (current_schemas(false))
+      SQL
+      ).group_by { |row| quote(row[0]) }
+       .transform_values do |rows|
+        rows
+          .group_by { |row| row[1] }
+          .transform_values do |rows|
+          rows.first[2] # Get the comment from the first row
+        end
+      end
+
       @__preload[:table_comment] ||= table_names.map do |table_name|
         scope = quoted_scope(table_name, type: "BASE TABLE")
         [
           table_name,
           if scope[:name]
-            query_value(<<~SQL, "SCHEMA")
-              SELECT pg_catalog.obj_description(c.oid, 'pg_class')
-              FROM pg_catalog.pg_class c
-                LEFT JOIN pg_namespace n ON n.oid = c.relnamespace
-              WHERE c.relname = #{scope[:name]}
-                AND c.relkind IN (#{scope[:type]})
-                AND n.nspname = #{scope[:schema]}
-            SQL
+            find_by_scope(scope_map, scope)
           end
         ]
       end.to_h
     end
 
     def preload_inherited_table_names(table_names)
+      scope_map = (query(<<~SQL, "SCHEMA")
+        SELECT child.relname AS relname, n.nspname AS nspname, parent.relname AS parent_relname
+        FROM pg_catalog.pg_inherits i
+          JOIN pg_catalog.pg_class child ON i.inhrelid = child.oid
+          JOIN pg_catalog.pg_class parent ON i.inhparent = parent.oid
+          LEFT JOIN pg_namespace n ON n.oid = child.relnamespace
+        WHERE child.relkind IN ('r', 'p')
+          AND n.nspname = ANY (current_schemas(false))
+      SQL
+      ).group_by { |row| quote(row[0]) }
+       .transform_values do |rows|
+        rows
+          .group_by { |row| row[1] }
+          .transform_values do |rows|
+          rows.map { |r| r[2] } # Get parent table names
+        end
+      end
+
       @__preload[:inherited_table_names] ||= table_names.map do |table_name|
         scope = quoted_scope(table_name, type: "BASE TABLE")
 
         [
           table_name,
-          query_values(<<~SQL, "SCHEMA")
-            SELECT parent.relname
-            FROM pg_catalog.pg_inherits i
-              JOIN pg_catalog.pg_class child ON i.inhrelid = child.oid
-              JOIN pg_catalog.pg_class parent ON i.inhparent = parent.oid
-              LEFT JOIN pg_namespace n ON n.oid = child.relnamespace
-            WHERE child.relname = #{scope[:name]}
-              AND child.relkind IN (#{scope[:type]})
-              AND n.nspname = #{scope[:schema]}
-          SQL
+          find_by_scope(scope_map, scope) || []
         ]
       end.to_h
     end
 
     def preload_table_partition_definition(table_names)
+      scope_map = (query(<<~SQL, "SCHEMA")
+        SELECT c.relname AS relname, n.nspname AS nspname, pg_catalog.pg_get_partkeydef(c.oid) AS partition_def
+        FROM pg_catalog.pg_class c
+          LEFT JOIN pg_namespace n ON n.oid = c.relnamespace
+        WHERE c.relkind IN ('r', 'p')
+          AND n.nspname = ANY (current_schemas(false))
+      SQL
+      ).group_by { |row| quote(row[0]) }
+       .transform_values do |rows|
+        rows
+          .group_by { |row| row[1] }
+          .transform_values do |rows|
+          rows.first[2] # Get the partition definition from the first row
+        end
+      end
+
       @__preload[:table_partition_definition] ||= table_names.map do |table_name|
         scope = quoted_scope(table_name, type: "BASE TABLE")
 
         [
           table_name,
-          query_value(<<~SQL, "SCHEMA")
-            SELECT pg_catalog.pg_get_partkeydef(c.oid)
-            FROM pg_catalog.pg_class c
-              LEFT JOIN pg_namespace n ON n.oid = c.relnamespace
-            WHERE c.relname = #{scope[:name]}
-              AND c.relkind IN (#{scope[:type]})
-              AND n.nspname = #{scope[:schema]}
-          SQL
+          find_by_scope(scope_map, scope) || [],
         ]
       end.to_h
     end
