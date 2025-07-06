@@ -9,30 +9,38 @@ module ActiveRecord::ConnectionAdapters
 
     def initialize(...)
       super
-      @__preload = {}
       preload(tables)
     end
 
-    CACHEABLE_METHODS = [
-      :column_definitions,
-      :primary_keys,
-      :table_options,
-      :indexes,
-      :foreign_keys,
-      :check_constraints,
-      :exclusion_constraints,
-      :unique_constraints,
-    ].freeze
+    CACHEABLE_METHODS = {
+      column_definitions: [],
+      primary_keys: [],
+      indexes: [],
+      foreign_keys: [],
+      check_constraints: [],
+      exclusion_constraints: [],
+      unique_constraints: [],
+      table_options: [
+        :table_comment,
+        :inherited_table_names,
+        :table_partition_definition
+      ],
+      table_comment: [],
+      inherited_table_names: [],
+      table_partition_definition: []
+    }.freeze
 
     def preload(table_names)
-      preload_column_definitions(table_names)
-      CACHEABLE_METHODS.each do |method_name|
-        preload_method = "preload_#{method_name}"
-        send(preload_method, table_names)
+      @__preload = {}
+      CACHEABLE_METHODS.each do |method_name, children|
+        children&.each do |child|
+          send("preload_#{child}", table_names)
+        end
+        send("preload_#{method_name}", table_names)
       end
     end
 
-    CACHEABLE_METHODS.each do |method_name|
+    CACHEABLE_METHODS.each do |method_name, _|
       define_method(method_name) do |table_name|
         get_cached_or_compute(method_name, table_name) { super(table_name) }
       end
@@ -41,44 +49,58 @@ module ActiveRecord::ConnectionAdapters
     private
 
     def preload_column_definitions(table_names)
+      table_name_map = (
+        query(<<~SQL, "SCHEMA")
+          SELECT (a.attrelid::regclass)::text, a.attnum, a.attname, format_type(a.atttypid, a.atttypmod),
+                 pg_get_expr(d.adbin, d.adrelid), a.attnotnull, a.atttypid, a.atttypmod,
+                 c.collname, col_description(a.attrelid, a.attnum) AS comment,
+                 #{supports_identity_columns? ? 'attidentity' : quote('')} AS identity,
+                 #{supports_virtual_columns? ? 'attgenerated' : quote('')} as attgenerated
+            FROM pg_attribute a
+            LEFT JOIN pg_attrdef d ON a.attrelid = d.adrelid AND a.attnum = d.adnum
+            LEFT JOIN pg_type t ON a.atttypid = t.oid
+            LEFT JOIN pg_collation c ON a.attcollation = c.oid AND a.attcollation <> t.typcollation
+           WHERE a.attnum > 0 AND NOT a.attisdropped
+        SQL
+      ).group_by(&:first)
+       .transform_values do |rows|
+        rows
+          .sort_by { |r| r[1] } # ORDER BY a.attnum
+          .reject { |r| r[1] <= 0 }
+          .map { |columns| columns[2..] } # Ignore `(a.attrelid::regclass)::text`, a.attnum
+      end
+
       @__preload[:column_definitions] = table_names.map do |table_name|
         [
           table_name,
-          query(<<~SQL, "SCHEMA")
-            SELECT a.attname, format_type(a.atttypid, a.atttypmod),
-                   pg_get_expr(d.adbin, d.adrelid), a.attnotnull, a.atttypid, a.atttypmod,
-                   c.collname, col_description(a.attrelid, a.attnum) AS comment,
-                   #{supports_identity_columns? ? 'attidentity' : quote('')} AS identity,
-                   #{supports_virtual_columns? ? 'attgenerated' : quote('')} as attgenerated
-              FROM pg_attribute a
-              LEFT JOIN pg_attrdef d ON a.attrelid = d.adrelid AND a.attnum = d.adnum
-              LEFT JOIN pg_type t ON a.atttypid = t.oid
-              LEFT JOIN pg_collation c ON a.attcollation = c.oid AND a.attcollation <> t.typcollation
-             WHERE a.attrelid = #{quote(quote_table_name(table_name))}::regclass
-               AND a.attnum > 0 AND NOT a.attisdropped
-             ORDER BY a.attnum
-          SQL
+          table_name_map[table_name] || [],
         ]
       end.to_h
     end
 
     def preload_primary_keys(table_names)
+      table_name_map = (
+        query_values(<<~SQL, "SCHEMA")
+          SELECT (a.attrelid::regclass)::text, i.idx, a.attname
+            FROM (
+                   SELECT indrelid, indkey, generate_subscripts(indkey, 1) idx
+                     FROM pg_index
+                    WHERE indisprimary
+                 ) i
+            JOIN pg_attribute a
+              ON a.attrelid = i.indrelid
+             AND a.attnum = i.indkey[i.idx]
+        SQL
+      ).group_by(&:first)
+       .transform_values do |rows|
+        rows
+          .sort_by { |r| r[1] } # ORDER BY a.attnum
+          .map { |columns| columns[2] } # a.attname only
+      end
       @__preload[:primary_keys] = table_names.map do |table_name|
         [
           table_name,
-          query_values(<<~SQL, "SCHEMA")
-            SELECT a.attname
-              FROM (
-                     SELECT indrelid, indkey, generate_subscripts(indkey, 1) idx
-                       FROM pg_index
-                      WHERE indrelid = #{quote(quote_table_name(table_name))}::regclass
-                        AND indisprimary
-                   ) i
-              JOIN pg_attribute a
-                ON a.attrelid = i.indrelid
-               AND a.attnum = i.indkey[i.idx]
-             ORDER BY i.idx
-          SQL
+          table_name_map[table_name] || [],
         ]
       end.to_h
     end
@@ -103,7 +125,7 @@ module ActiveRecord::ConnectionAdapters
 
         [
           table_name,
-          options
+          options || {},
         ]
       end.to_h
     end
@@ -180,7 +202,10 @@ module ActiveRecord::ConnectionAdapters
           )
         end
 
-        [table_name, indexes]
+        [
+          table_name,
+          indexes || [],
+        ]
       end.to_h
     end
 
@@ -351,6 +376,63 @@ module ActiveRecord::ConnectionAdapters
           end
         ]
       end
+    end
+
+    def preload_table_comment(table_names)
+      @__preload[:table_comment] ||= table_names.map do |table_name|
+        scope = quoted_scope(table_name, type: "BASE TABLE")
+        [
+          table_name,
+          if scope[:name]
+            query_value(<<~SQL, "SCHEMA")
+              SELECT pg_catalog.obj_description(c.oid, 'pg_class')
+              FROM pg_catalog.pg_class c
+                LEFT JOIN pg_namespace n ON n.oid = c.relnamespace
+              WHERE c.relname = #{scope[:name]}
+                AND c.relkind IN (#{scope[:type]})
+                AND n.nspname = #{scope[:schema]}
+            SQL
+          end
+        ]
+      end.to_h
+    end
+
+    def preload_inherited_table_names(table_names)
+      @__preload[:inherited_table_names] ||= table_names.map do |table_name|
+        scope = quoted_scope(table_name, type: "BASE TABLE")
+
+        [
+          table_name,
+          query_values(<<~SQL, "SCHEMA")
+            SELECT parent.relname
+            FROM pg_catalog.pg_inherits i
+              JOIN pg_catalog.pg_class child ON i.inhrelid = child.oid
+              JOIN pg_catalog.pg_class parent ON i.inhparent = parent.oid
+              LEFT JOIN pg_namespace n ON n.oid = child.relnamespace
+            WHERE child.relname = #{scope[:name]}
+              AND child.relkind IN (#{scope[:type]})
+              AND n.nspname = #{scope[:schema]}
+          SQL
+        ]
+      end.to_h
+    end
+
+    def preload_table_partition_definition(table_names)
+      @__preload[:table_partition_definition] ||= table_names.map do |table_name|
+        scope = quoted_scope(table_name, type: "BASE TABLE")
+
+        [
+          table_name,
+          query_value(<<~SQL, "SCHEMA")
+            SELECT pg_catalog.pg_get_partkeydef(c.oid)
+            FROM pg_catalog.pg_class c
+              LEFT JOIN pg_namespace n ON n.oid = c.relnamespace
+            WHERE c.relname = #{scope[:name]}
+              AND c.relkind IN (#{scope[:type]})
+              AND n.nspname = #{scope[:schema]}
+          SQL
+        ]
+      end.to_h
     end
 
     def get_cached_or_compute(cache_key, table_name)
