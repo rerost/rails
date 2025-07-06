@@ -80,7 +80,7 @@ module ActiveRecord::ConnectionAdapters
 
     def preload_primary_keys(table_names)
       table_name_map = (
-        query_values(<<~SQL, "SCHEMA")
+        query(<<~SQL, "SCHEMA")
           SELECT (a.attrelid::regclass)::text, i.idx, a.attname
             FROM (
                    SELECT indrelid, indkey, generate_subscripts(indkey, 1) idx
@@ -94,7 +94,7 @@ module ActiveRecord::ConnectionAdapters
       ).group_by(&:first)
        .transform_values do |rows|
         rows
-          .sort_by { |r| r[1] } # ORDER BY a.attnum
+          .sort_by { |r| r[1] } # ORDER BY i.idx
           .map { |columns| columns[2] } # a.attname only
       end
       @__preload[:primary_keys] = table_names.map do |table_name|
