@@ -327,19 +327,24 @@ module ActiveRecord::ConnectionAdapters
     end
 
     def preload_exclusion_constraints(table_names)
-      @__preload[:exclusion_constraints] ||= table_names.map do |table_name|
-        scope = quoted_scope(table_name)
-
-        exclusion_info = internal_exec_query(<<-SQL, "SCHEMA")
-            SELECT conname, pg_get_constraintdef(c.oid) AS constraintdef, c.condeferrable, c.condeferred
+      scope_map = (internal_exec_query(<<-SQL, "SCHEMA")
+            SELECT t.relname, n.nspname, conname, pg_get_constraintdef(c.oid) AS constraintdef, c.condeferrable, c.condeferred
             FROM pg_constraint c
             JOIN pg_class t ON c.conrelid = t.oid
             JOIN pg_namespace n ON n.oid = c.connamespace
             WHERE c.contype = 'x'
-              AND t.relname = #{scope[:name]}
-              AND n.nspname = #{scope[:schema]}
-        SQL
+              AND n.nspname = ANY (current_schemas(false))
+      SQL
+      ).group_by { |row| quote(row["relname"]) }
+       .transform_values do |rows|
+        rows
+          .group_by { |row| row["nspname"] }
+      end
 
+      @__preload[:exclusion_constraints] ||= table_names.map do |table_name|
+        scope = quoted_scope(table_name)
+
+        exclusion_info = find_by_scope(scope_map, scope)
         [
           table_name,
           exclusion_info.map do |row|
