@@ -280,7 +280,7 @@ module ActiveRecord::ConnectionAdapters
     end
 
     def preload_check_constraints(table_names)
-      @__preload[:foreign_keys] ||= table_names.map do |table_name|
+      @__preload[:check_constraints] ||= table_names.map do |table_name|
         scope = quoted_scope(table_name)
 
         check_info = internal_exec_query(<<-SQL, "SCHEMA", allow_retry: true, materialize_transactions: false)
@@ -309,7 +309,7 @@ module ActiveRecord::ConnectionAdapters
     end
 
     def preload_exclusion_constraints(table_names)
-      @__preload[:foreign_keys] ||= table_names.map do |table_name|
+      @__preload[:exclusion_constraints] ||= table_names.map do |table_name|
         scope = quoted_scope(table_name)
 
         exclusion_info = internal_exec_query(<<-SQL, "SCHEMA")
@@ -339,14 +339,14 @@ module ActiveRecord::ConnectionAdapters
               deferrable: deferrable
             }
 
-            ExclusionConstraintDefinition.new(table_name, method_and_elements_parts["expression"], options)
+            ActiveRecord::ConnectionAdapters::PostgreSQL::ExclusionConstraintDefinition.new(table_name, method_and_elements_parts["expression"], options)
           end
         ]
       end.to_h
     end
 
     def preload_unique_constraints(table_names)
-      @__preload[:foreign_keys] ||= table_names.map do |table_name|
+      @__preload[:unique_constraints] ||= table_names.map do |table_name|
         scope = quoted_scope(table_name)
 
         unique_info = internal_exec_query(<<~SQL, "SCHEMA", allow_retry: true, materialize_transactions: false)
@@ -382,7 +382,7 @@ module ActiveRecord::ConnectionAdapters
               deferrable: deferrable
             }
 
-            UniqueConstraintDefinition.new(table_name, columns, options)
+            ActiveRecord::ConnectionAdapters::PostgreSQL::UniqueConstraintDefinition.new(table_name, columns, options)
           end
         ]
       end
