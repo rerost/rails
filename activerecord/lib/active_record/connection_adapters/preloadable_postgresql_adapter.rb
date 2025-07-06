@@ -289,18 +289,27 @@ module ActiveRecord::ConnectionAdapters
     end
 
     def preload_check_constraints(table_names)
-      @__preload[:check_constraints] ||= table_names.map do |table_name|
-        scope = quoted_scope(table_name)
-
-        check_info = internal_exec_query(<<-SQL, "SCHEMA", allow_retry: true, materialize_transactions: false)
-            SELECT conname, pg_get_constraintdef(c.oid, true) AS constraintdef, c.convalidated AS valid
+      scope_map = (internal_exec_query(<<-SQL, "SCHEMA", allow_retry: true, materialize_transactions: false)
+            SELECT t.relname AS relname, n.nspname AS nspname, conname, pg_get_constraintdef(c.oid, true) AS constraintdef, c.convalidated AS valid
             FROM pg_constraint c
             JOIN pg_class t ON c.conrelid = t.oid
             JOIN pg_namespace n ON n.oid = c.connamespace
             WHERE c.contype = 'c'
-              AND t.relname = #{scope[:name]}
-              AND n.nspname = #{scope[:schema]}
-        SQL
+              AND n.nspname = ANY (current_schemas(false))
+      SQL
+      ).group_by { |row| quote(row["relname"]) }
+       .transform_values do |rows|
+        rows
+          .group_by { |row| row["nspname"] }
+          .transform_values do |rows|
+          rows.sort_by { |r| r["conname"] }
+        end
+      end
+
+      @__preload[:check_constraints] ||= table_names.map do |table_name|
+        scope = quoted_scope(table_name)
+
+        check_info = find_by_scope(scope_map, scope)
 
         [
           table_name,
