@@ -1,7 +1,6 @@
 # frozen_string_literal: true
 require "active_record/connection_adapters/postgresql_adapter"
 require "active_record/connection_adapters/postgresql/schema_definitions"
-require "active_support/core_ext/string"
 
 module ActiveRecord::ConnectionAdapters
   class PreloadablePostgreSQLAdapter < ActiveRecord::ConnectionAdapters::PostgreSQLAdapter
