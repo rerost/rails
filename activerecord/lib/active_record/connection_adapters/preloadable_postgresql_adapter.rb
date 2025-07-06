@@ -385,7 +385,7 @@ module ActiveRecord::ConnectionAdapters
             ActiveRecord::ConnectionAdapters::PostgreSQL::UniqueConstraintDefinition.new(table_name, columns, options)
           end
         ]
-      end
+      end.to_h
     end
 
     def preload_table_comment(table_names)
