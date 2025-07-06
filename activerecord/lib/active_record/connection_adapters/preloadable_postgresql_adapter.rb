@@ -131,11 +131,9 @@ module ActiveRecord::ConnectionAdapters
     end
 
     def preload_indexes(table_names)
-      @__preload[:indexes] ||= table_names.map do |table_name|
-        scope = quoted_scope(table_name)
-
-        result = query(<<~SQL, "SCHEMA")
-          SELECT distinct i.relname, d.indisunique, d.indkey, pg_get_indexdef(d.indexrelid),
+      scope_map = (
+        query(<<~SQL, "SCHEMA")
+          SELECT distinct t.relname, n.nspname, i.relname, d.indisunique, d.indkey, pg_get_indexdef(d.indexrelid),
                           pg_catalog.obj_description(i.oid, 'pg_class') AS comment, d.indisvalid,
                           ARRAY(
                             SELECT pg_get_indexdef(d.indexrelid, k + 1, true)
@@ -147,13 +145,25 @@ module ActiveRecord::ConnectionAdapters
           INNER JOIN pg_class i ON d.indexrelid = i.oid
           LEFT JOIN pg_namespace n ON n.oid = t.relnamespace
           WHERE i.relkind IN ('i', 'I')
+            AND n.nspname = ANY (current_schemas(false))
             AND d.indisprimary = 'f'
-            AND t.relname = #{scope[:name]}
-            AND n.nspname = #{scope[:schema]}
-          ORDER BY i.relname
         SQL
+      ).group_by { |row| quote(row[0]) }
+       .transform_values do |rows|
+        rows
+          .group_by { |row| row[1] }
+          .transform_values do |rows|
+          rows.sort_by { |r| r[2] } # ORDER BY i.relname
+              .map { |r| r[2..] } # a.attname only
+        end
+      end
 
-        indexes = result.map do |row|
+      @__preload[:indexes] ||= table_names.map do |table_name|
+        scope = quoted_scope(table_name)
+
+        scope_result = find_by_scope(scope_map, scope)
+
+        indexes = scope_result.map do |row|
           index_name = row[0]
           unique = row[1]
           indkey = row[2].split(" ").map(&:to_i)
@@ -437,6 +447,21 @@ module ActiveRecord::ConnectionAdapters
 
     def get_cached_or_compute(cache_key, table_name)
       @__preload&.dig(cache_key, table_name) || yield
+    end
+
+    def find_by_scope(scope_map, scope)
+      result = scope_map[scope[:name]]
+      if result.nil?
+        nil
+      else
+        if (result.key?(scope[:schema]))
+          result[scope[:schema]]
+        else
+          if scope[:schema] == "ANY (current_schemas(false))"
+            result.values.flatten(1)
+          end
+        end
+      end || []
     end
   end
 end
